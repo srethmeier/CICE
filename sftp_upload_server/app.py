@@ -13,9 +13,13 @@ import io
 import os
 import stat
 import logging
+from contextlib import asynccontextmanager
 
 import paramiko
-from flask import Flask, Response, request
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, Security
+from fastapi.responses import PlainTextResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -58,22 +62,24 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Flask app
+# FastAPI app
 # ---------------------------------------------------------------------------
 
-app = Flask(__name__)
+security = HTTPBearer()
 
 
-def _check_auth() -> Response | None:
-    """Return an error Response if the request is not properly authenticated,
-    or ``None`` when authentication succeeds."""
-    header = request.headers.get("Authorization", "")
-    if not header.startswith("Bearer "):
-        return Response("Missing Bearer token\n", status=401)
-    token = header[len("Bearer "):]
-    if token != Config.AUTH_TOKEN:
-        return Response("Invalid token\n", status=403)
-    return None
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    _validate_config()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def _verify_token(credentials: HTTPAuthorizationCredentials) -> None:
+    if credentials.credentials != Config.AUTH_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
 
 def _ensure_remote_dir(sftp: paramiko.SFTPClient, path: str) -> None:
@@ -109,8 +115,12 @@ def _upload_to_sftp(data: bytes, remote_path: str) -> None:
         transport.close()
 
 
-@app.route("/upload/<path:filename>", methods=["PUT"])
-def upload(filename: str) -> Response:
+@app.put("/upload/{filename:path}", status_code=201, response_class=PlainTextResponse)
+async def upload(
+    filename: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Security(security),
+) -> str:
     """Accept a file via HTTP PUT and upload it to the SFTP server.
 
     Usage::
@@ -120,13 +130,11 @@ def upload(filename: str) -> Response:
              --data-binary @localfile.txt \
              http://localhost:8080/upload/path/to/remote/file.txt
     """
-    auth_err = _check_auth()
-    if auth_err is not None:
-        return auth_err
+    _verify_token(credentials)
 
-    data = request.get_data()
+    data = await request.body()
     if not data:
-        return Response("Empty body\n", status=400)
+        raise HTTPException(status_code=400, detail="Empty body")
 
     remote_path = f"{Config.SFTP_REMOTE_DIR.rstrip('/')}/{filename}"
 
@@ -135,10 +143,10 @@ def upload(filename: str) -> Response:
         _upload_to_sftp(data, remote_path)
     except Exception:
         log.exception("SFTP upload failed")
-        return Response("SFTP upload failed\n", status=502)
+        raise HTTPException(status_code=502, detail="SFTP upload failed")
 
     log.info("Upload complete: %s", remote_path)
-    return Response("OK\n", status=201)
+    return "OK\n"
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +154,5 @@ def upload(filename: str) -> Response:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    _validate_config()
     port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
