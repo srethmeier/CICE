@@ -126,7 +126,7 @@ async def lifespan(application: FastAPI):
     yield
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(title="disp-api", lifespan=lifespan)
 
 
 def _verify_token(credentials: HTTPAuthorizationCredentials) -> None:
@@ -167,7 +167,7 @@ def _upload_to_sftp(target: SFTPTarget, data: bytes, remote_path: str) -> None:
         transport.close()
 
 
-@app.put("/upload/{target_name}/{filename:path}", status_code=201, response_class=PlainTextResponse)
+@app.put("/{target_name}/{filename:path}", status_code=201, response_class=PlainTextResponse)
 async def upload(
     target_name: str,
     filename: str,
@@ -176,15 +176,15 @@ async def upload(
 ) -> str:
     """Accept a file via HTTP PUT and upload it to the SFTP server.
 
-    The first path segment after ``/upload/`` selects the SFTP target
-    (as defined in ``targets.json``).
+    The first path segment selects the SFTP target (as defined in
+    ``targets.json``).
 
     Usage::
 
         curl -X PUT \\
              -H "Authorization: Bearer <token>" \\
              --data-binary @localfile.txt \\
-             http://localhost:8080/upload/backups/path/to/remote/file.txt
+             http://localhost:8080/backups/path/to/remote/file.txt
     """
     _verify_token(credentials)
 
