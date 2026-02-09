@@ -8,12 +8,11 @@ users and keys per base path.
 
 Access to the endpoint is protected by a simple Bearer-token check.
 
-Configuration is done via a JSON file – see ``targets.json.example``
-or the ``_load_targets`` function below.
+Configuration is done via the TARGETS_YAML environment variable – see
+``targets.yaml.example`` or the ``_load_targets`` function below.
 """
 
 import io
-import json
 import os
 import stat
 import logging
@@ -22,6 +21,7 @@ from dataclasses import dataclass
 
 import paramiko
 import uvicorn
+import yaml
 from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -31,7 +31,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # ---------------------------------------------------------------------------
 
 AUTH_TOKEN: str = os.environ.get("AUTH_TOKEN", "")
-TARGETS_FILE: str = os.environ.get("TARGETS_FILE", "targets.json")
+TARGETS_YAML: str = os.environ.get("TARGETS_YAML", "")
 
 
 @dataclass(frozen=True)
@@ -49,31 +49,26 @@ class SFTPTarget:
 _targets: dict[str, SFTPTarget] = {}
 
 
-def _load_targets(path: str) -> dict[str, SFTPTarget]:
-    """Load SFTP target definitions from a JSON file.
+def _load_targets(raw_yaml: str) -> dict[str, SFTPTarget]:
+    """Parse SFTP target definitions from a YAML string.
 
     Expected format::
 
-        {
-            "backups": {
-                "host": "backup.example.com",
-                "port": 22,
-                "user": "backupuser",
-                "key_path": "/keys/backup_rsa",
-                "remote_dir": "/data/backups"
-            },
-            "logs": {
-                "host": "logs.example.com",
-                "user": "logwriter",
-                "key_path": "/keys/log_rsa",
-                "remote_dir": "/var/incoming"
-            }
-        }
+        backups:
+          host: backup.example.com
+          port: 22
+          user: backupuser
+          key_path: /keys/backup_rsa
+          remote_dir: /data/backups
+        logs:
+          host: logs.example.com
+          user: logwriter
+          key_path: /keys/log_rsa
+          remote_dir: /var/incoming
 
     ``port`` defaults to 22, ``remote_dir`` defaults to ``/upload``.
     """
-    with open(path) as fh:
-        raw = json.load(fh)
+    raw = yaml.safe_load(raw_yaml)
 
     targets: dict[str, SFTPTarget] = {}
     for name, cfg in raw.items():
@@ -95,10 +90,10 @@ def _load_targets(path: str) -> dict[str, SFTPTarget]:
 def _validate_config() -> None:
     if not AUTH_TOKEN:
         raise RuntimeError("Required environment variable not set: AUTH_TOKEN")
+    if not TARGETS_YAML:
+        raise RuntimeError("Required environment variable not set: TARGETS_YAML")
     if not _targets:
-        raise RuntimeError(
-            f"No SFTP targets loaded – check {TARGETS_FILE}"
-        )
+        raise RuntimeError("No SFTP targets loaded – check TARGETS_YAML")
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +115,7 @@ security = HTTPBearer()
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    _targets.update(_load_targets(TARGETS_FILE))
+    _targets.update(_load_targets(TARGETS_YAML))
     _validate_config()
     log.info("Loaded %d SFTP target(s): %s", len(_targets), ", ".join(_targets))
     yield
@@ -177,7 +172,7 @@ async def upload(
     """Accept a file via HTTP PUT and upload it to the SFTP server.
 
     The first path segment selects the SFTP target (as defined in
-    ``targets.json``).
+    the ``TARGETS_YAML`` env var).
 
     Usage::
 
