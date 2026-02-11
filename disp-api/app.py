@@ -1,10 +1,10 @@
 """
-HTTP PUT -> SFTP upload server.
+HTTP PUT -> SFTPGo upload server.
 
 Exposes a PUT endpoint that accepts a file and uploads it to a remote
-SFTP server using SSH-key-based authentication.  The first path segment
-of the URL selects which SFTP target to use, allowing different servers,
-users and keys per base path.
+SFTPGo server using its REST API.  The first path segment of the URL
+selects which SFTPGo target to use, allowing different servers, users
+and credentials per base path.
 
 Access to the endpoint is protected by a simple Bearer-token check.
 
@@ -12,14 +12,13 @@ Configuration is done via the TARGETS_YAML environment variable – see
 ``targets.yaml.example`` or the ``_load_targets`` function below.
 """
 
-import io
 import os
-import stat
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from urllib.parse import quote
 
-import paramiko
+import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Security
@@ -35,54 +34,51 @@ TARGETS_YAML: str = os.environ.get("TARGETS_YAML", "")
 
 
 @dataclass(frozen=True)
-class SFTPTarget:
-    """Connection details for a single SFTP destination."""
+class SFTPGoTarget:
+    """Connection details for a single SFTPGo destination."""
 
-    host: str
-    port: int
+    url: str
     user: str
-    key_path: str
+    password: str
     remote_dir: str
 
 
-# name -> SFTPTarget, populated at startup
-_targets: dict[str, SFTPTarget] = {}
+# name -> SFTPGoTarget, populated at startup
+_targets: dict[str, SFTPGoTarget] = {}
 
 
-def _load_targets(raw_yaml: str) -> dict[str, SFTPTarget]:
-    """Parse SFTP target definitions from a YAML string.
+def _load_targets(raw_yaml: str) -> dict[str, SFTPGoTarget]:
+    """Parse SFTPGo target definitions from a YAML string.
 
     Expected format::
 
         backups:
-          host: backup.example.com
-          port: 22
+          url: https://sftpgo.example.com
           user: backupuser
-          key_path: /keys/backup_rsa
+          password: s3cret
           remote_dir: /data/backups
         logs:
-          host: logs.example.com
+          url: https://sftpgo-logs.example.com
           user: logwriter
-          key_path: /keys/log_rsa
+          password: wr1t3r
           remote_dir: /var/incoming
 
-    ``port`` defaults to 22, ``remote_dir`` defaults to ``/upload``.
+    ``remote_dir`` defaults to ``/``.
     """
     raw = yaml.safe_load(raw_yaml)
 
-    targets: dict[str, SFTPTarget] = {}
+    targets: dict[str, SFTPGoTarget] = {}
     for name, cfg in raw.items():
-        missing = [k for k in ("host", "user", "key_path") if k not in cfg]
+        missing = [k for k in ("url", "user", "password") if k not in cfg]
         if missing:
             raise RuntimeError(
                 f"Target '{name}' is missing required fields: {', '.join(missing)}"
             )
-        targets[name] = SFTPTarget(
-            host=cfg["host"],
-            port=int(cfg.get("port", 22)),
+        targets[name] = SFTPGoTarget(
+            url=cfg["url"].rstrip("/"),
             user=cfg["user"],
-            key_path=cfg["key_path"],
-            remote_dir=cfg.get("remote_dir", "/upload"),
+            password=cfg["password"],
+            remote_dir=cfg.get("remote_dir", "/"),
         )
     return targets
 
@@ -93,7 +89,7 @@ def _validate_config() -> None:
     if not TARGETS_YAML:
         raise RuntimeError("Required environment variable not set: TARGETS_YAML")
     if not _targets:
-        raise RuntimeError("No SFTP targets loaded – check TARGETS_YAML")
+        raise RuntimeError("No SFTPGo targets loaded – check TARGETS_YAML")
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +103,46 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# SFTPGo REST API helpers
+# ---------------------------------------------------------------------------
+
+
+async def _get_sftpgo_token(client: httpx.AsyncClient, target: SFTPGoTarget) -> str:
+    """Authenticate against the SFTPGo user token endpoint and return a JWT."""
+    resp = await client.get(
+        f"{target.url}/api/v2/user/token",
+        auth=(target.user, target.password),
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"SFTPGo token request failed ({resp.status_code}): {resp.text}"
+        )
+    return resp.json()["access_token"]
+
+
+async def _upload_to_sftpgo(target: SFTPGoTarget, data: bytes, remote_path: str) -> None:
+    """Upload *data* to *remote_path* on the SFTPGo server via its REST API."""
+    async with httpx.AsyncClient() as client:
+        token = await _get_sftpgo_token(client, target)
+
+        encoded_path = quote(remote_path, safe="/")
+        upload_url = (
+            f"{target.url}/api/v2/user/files/upload"
+            f"?path={encoded_path}&mkdir_parents=true"
+        )
+
+        resp = await client.post(
+            upload_url,
+            headers={"Authorization": f"Bearer {token}"},
+            content=data,
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"SFTPGo upload failed ({resp.status_code}): {resp.text}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
@@ -117,7 +153,7 @@ security = HTTPBearer()
 async def lifespan(application: FastAPI):
     _targets.update(_load_targets(TARGETS_YAML))
     _validate_config()
-    log.info("Loaded %d SFTP target(s): %s", len(_targets), ", ".join(_targets))
+    log.info("Loaded %d SFTPGo target(s): %s", len(_targets), ", ".join(_targets))
     yield
 
 
@@ -129,39 +165,6 @@ def _verify_token(credentials: HTTPAuthorizationCredentials) -> None:
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
-def _ensure_remote_dir(sftp: paramiko.SFTPClient, path: str) -> None:
-    """Recursively create *path* on the remote server if it doesn't exist."""
-    parts = path.strip("/").split("/")
-    current = ""
-    for part in parts:
-        current = f"{current}/{part}"
-        try:
-            st = sftp.stat(current)
-            if not stat.S_ISDIR(st.st_mode):
-                raise RuntimeError(f"Remote path {current} exists but is not a directory")
-        except FileNotFoundError:
-            sftp.mkdir(current)
-
-
-def _upload_to_sftp(target: SFTPTarget, data: bytes, remote_path: str) -> None:
-    """Open an SFTP connection to *target* and write *data* to *remote_path*."""
-    pkey = paramiko.RSAKey.from_private_key_file(target.key_path)
-
-    transport = paramiko.Transport((target.host, target.port))
-    try:
-        transport.connect(username=target.user, pkey=pkey)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        try:
-            remote_dir = os.path.dirname(remote_path)
-            if remote_dir:
-                _ensure_remote_dir(sftp, remote_dir)
-            sftp.putfo(io.BytesIO(data), remote_path)
-        finally:
-            sftp.close()
-    finally:
-        transport.close()
-
-
 @app.put("/{target_name}/{filename:path}", status_code=201, response_class=PlainTextResponse)
 async def upload(
     target_name: str,
@@ -169,9 +172,9 @@ async def upload(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Security(security),
 ) -> str:
-    """Accept a file via HTTP PUT and upload it to the SFTP server.
+    """Accept a file via HTTP PUT and upload it to SFTPGo.
 
-    The first path segment selects the SFTP target (as defined in
+    The first path segment selects the SFTPGo target (as defined in
     the ``TARGETS_YAML`` env var).
 
     Usage::
@@ -196,14 +199,14 @@ async def upload(
 
     remote_path = f"{target.remote_dir.rstrip('/')}/{filename}"
 
-    log.info("Uploading %d bytes -> %s@%s:%s", len(data), target.user, target.host, remote_path)
+    log.info("Uploading %d bytes -> %s @ %s (%s)", len(data), remote_path, target.url, target.user)
     try:
-        _upload_to_sftp(target, data, remote_path)
+        await _upload_to_sftpgo(target, data, remote_path)
     except Exception:
-        log.exception("SFTP upload failed for target '%s'", target_name)
-        raise HTTPException(status_code=502, detail="SFTP upload failed")
+        log.exception("SFTPGo upload failed for target '%s'", target_name)
+        raise HTTPException(status_code=502, detail="SFTPGo upload failed")
 
-    log.info("Upload complete: %s@%s:%s", target.user, target.host, remote_path)
+    log.info("Upload complete: %s @ %s", remote_path, target.url)
     return "OK\n"
 
 

@@ -1,12 +1,11 @@
 backups:
-  host: backup.example.com
-  port: 22
+  url: https://sftpgo.example.com
   user: backupuser
-  key_path: /keys/backup_rsa
+  password: s3cret
   remote_dir: /data/backups
 
 logs:
-  host: logs.example.com
+  url: https://sftpgo-logs.example.com
   user: logwriter
-  key_path: /keys/log_rsa
+  password: wr1t3r
   remote_dir: /var/incoming
